@@ -906,6 +906,7 @@ class Engine:
         self.active = 0                     # tasks currently in flight
         self.running_ids = set()            # de-dupe re-submits of a live task
         self._watcher_on = False
+        self._pool_size = None              # actual max_workers of the live pool
 
     def emit(self, kind, task=None, **extra):
         self.events.put({"kind": kind, "task": task, **extra})
@@ -925,6 +926,7 @@ class Engine:
     def _ensure_pool(self):
         if self.pool is None:
             self.pool = ThreadPoolExecutor(max_workers=self.workers)
+            self._pool_size = self.workers
 
     def _ensure_watcher(self):
         if not self._watcher_on:
@@ -936,9 +938,15 @@ class Engine:
               connections=1, delete_archives=False):
         self.configure(workers, auto_extract, dest_dir, timeout, max_attempts,
                        speed_limit, connections, delete_archives)
+        # Resize the worker pool when the parallel count changed and nothing is
+        # in flight (a ThreadPoolExecutor can't be resized in place).
+        with self.lock:
+            idle = self.active == 0
+        if self.pool is not None and idle and self._pool_size != self.workers:
+            self.pool.shutdown(wait=False)
+            self.pool = None
         self._ensure_pool()
-        if auto_extract:
-            self._ensure_watcher()
+        self._ensure_watcher()  # always run; it gates on self.auto_extract itself
         for t in tasks:
             t.paused = False
             self._submit(t)
@@ -1274,7 +1282,7 @@ class Engine:
                     entry = self._pick_entry(parts)
                     if entry:
                         extracted_groups.add(g)
-                        self._extract(entry, dest_dir)
+                        self._extract(entry)
                         if entry.status == "Extracted" and self.delete_archives:
                             self._delete_archive_files(parts)
 
@@ -1284,9 +1292,31 @@ class Engine:
                     continue
                 if t.status == "Done":
                     extracted_groups.add(t.name)
-                    self._extract(t, dest_dir)
+                    self._extract(t)
                     if t.status == "Extracted" and self.delete_archives:
                         self._delete_archive_files([t])
+
+    def extract_now(self, tasks):
+        """Manually (re)extract the archive group(s) the selected tasks belong to."""
+        if not SEVEN_ZIP:
+            self.emit("log", text="[extract] 7-Zip not found")
+            return
+        done = set()
+        keys = {archive_group(t.name) for t in tasks if archive_group(t.name)}
+        for k in keys:
+            parts = [t for t in self.tasks if archive_group(t.name) == k]
+            entry = self._pick_entry(parts)
+            if entry:
+                done.add(entry.name)
+                self._extract(entry)
+                if entry.status == "Extracted" and self.delete_archives:
+                    self._delete_archive_files(parts)
+        for t in tasks:
+            if archive_group(t.name) is None and is_extraction_entrypoint(t.name) \
+                    and t.name not in done:
+                self._extract(t)
+                if t.status == "Extracted" and self.delete_archives:
+                    self._delete_archive_files([t])
 
     def _delete_archive_files(self, parts):
         """After a verified extraction, reclaim space by removing the archives."""
@@ -1357,10 +1387,14 @@ class Engine:
             proc.wait()
         return proc.returncode, " ".join(tail[-3:])
 
-    def _extract(self, task, dest_dir):
+    def _extract(self, task):
         if not SEVEN_ZIP:
             self.emit("log", text=f"[extract] 7-Zip not found, skipping {task.name}")
             return
+        if not os.path.exists(task.path):
+            self.emit("log", text=f"[extract] file missing, skipping {task.name}")
+            return
+        dest_dir = task.dest_dir  # extract next to where the files actually are
 
         # 1) Integrity check first: a corrupt/incomplete archive should not be
         # silently "extracted". 7-Zip's test mode reads every volume's CRCs.
@@ -1704,6 +1738,7 @@ class App(tk.Tk):
         m.add_command(label="Pause", command=lambda: self._menu_action("pause"))
         m.add_command(label="Retry", command=lambda: self._menu_action("retry"))
         m.add_command(label="Re-check files", command=lambda: self._menu_action("recheck"))
+        m.add_command(label="Extract now", command=lambda: self._menu_action("extract"))
         m.add_command(label="Verify BINs (MD5)", command=lambda: self._menu_action("verify_bins"))
         m.add_separator()
         m.add_command(label="Move up", command=lambda: self._move(-1))
@@ -1760,6 +1795,8 @@ class App(tk.Tk):
             self._resume_tasks(tasks, reset=True)
         elif action == "recheck":
             self._recheck_tasks(tasks)
+        elif action == "extract":
+            self._extract_now(tasks)
         elif action == "verify_bins":
             self._verify_bins(tasks)
         elif action == "open_file":
@@ -2013,6 +2050,23 @@ class App(tk.Tk):
     def _open_fitgirl(self):
         RepackBrowser(self)
 
+    def _extract_now(self, tasks):
+        """Manually extract the selected archive(s) in the background."""
+        if not SEVEN_ZIP:
+            messagebox.showwarning("No 7-Zip", "7-Zip was not found, so extraction "
+                                   "is unavailable.")
+            return
+        self._log("Extracting selected archive(s)...")
+        snapshot = list(tasks)
+        threading.Thread(target=self._extract_worker, args=(snapshot,), daemon=True).start()
+
+    def _extract_worker(self, tasks):
+        try:
+            self.engine.extract_now(tasks)
+        except Exception as e:  # noqa
+            self.events.put({"kind": "log", "task": None,
+                             "text": f"[extract] error: {e}"})
+
     def queue_game(self, game, auto_start):
         """Grab a game's links: auto-queue what we can, open gated hosts in browser."""
         self._log(f"[browse] grabbing '{game['title']}' ...")
@@ -2030,7 +2084,7 @@ class App(tk.Tk):
         if auto:
             self.events.put({"kind": "add_urls", "task": None, "urls": auto,
                              "text": f"[browse] {game['title']}: {len(auto)} link(s)",
-                             "start": auto_start})
+                             "start": auto_start, "subdir": game["title"]})
         if manual:
             # Gated hosts (gofile/megadb/etc.) can't be auto-downloaded for free
             # accounts -- open each in the browser so the user finishes there.
@@ -2069,15 +2123,30 @@ class App(tk.Tk):
             ).start()
         self.url_text.delete("1.0", "end")
 
-    def _queue_urls(self, urls):
-        """Create tasks for new URLs (skipping duplicates). Returns count added."""
-        os.makedirs(self.dest_dir.get(), exist_ok=True)
+    def _queue_urls(self, urls, subdir=None):
+        """
+        Create tasks for new URLs (skipping duplicates), each routed into its own
+        folder under the save dir: an explicit `subdir` (a game title), else the
+        archive's base name for multi-part sets. Returns count added.
+        """
+        base = self.dest_dir.get()
+        os.makedirs(base, exist_ok=True)
         existing = {t.url for t in self.tasks}
         added = 0
         for u in urls:
             if u in existing:
                 continue
-            t = Task(u, self.dest_dir.get())
+            name = filename_from_url(u)
+            if subdir:
+                folder = os.path.join(base, sanitize(subdir))
+            else:
+                _, label = archive_group_info(name)
+                folder = os.path.join(base, sanitize(label)) if label else base
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError:
+                folder = base
+            t = Task(u, folder)
             self.tasks.append(t)
             self._insert_task_row(t)
             existing.add(u)
@@ -2196,7 +2265,7 @@ class App(tk.Tk):
                 elif kind == "add_urls":
                     if ev.get("text"):
                         self._log(ev["text"])
-                    added = self._queue_urls(ev["urls"])
+                    added = self._queue_urls(ev["urls"], ev.get("subdir"))
                     if ev.get("start") and added:
                         self._start()
                     dirty = True
