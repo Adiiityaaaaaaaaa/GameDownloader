@@ -524,24 +524,27 @@ SITES = {
 }
 
 
-# Hosts we can resolve to a real direct download (auto-queued).
-_AUTO_HOSTS = ("fuckingfast.co", "pixeldrain.com", "datanodes.to")
-# Hosts that gate downloads (premium/JS/captcha) -- opened in the browser instead.
-_MANUAL_HOSTS = ("gofile.io", "megadb.net", "buzzheavier", "1fichier.com",
-                 "filecrypt", "akirabox", "mega.nz", "mediafire.com")
-_ALL_HOSTS = _AUTO_HOSTS + _MANUAL_HOSTS
+# Hosts we resolve to a real direct download (single link -> single task).
+_AUTO_HOSTS = ("fuckingfast.co", "pixeldrain.com", "datanodes.to", "buzzheavier")
+# Hosts that are a *folder* we expand into many direct download tasks.
+_EXPAND_HOSTS = ("gofile.io",)
+# Hosts we still can't beat (premium/JS/captcha) -- opened in the browser.
+_MANUAL_HOSTS = ("megadb.net", "1fichier.com", "filecrypt", "akirabox",
+                 "mega.nz", "mediafire.com")
+_ALL_HOSTS = _AUTO_HOSTS + _EXPAND_HOSTS + _MANUAL_HOSTS
 
 
 def extract_download_links(page_url):
     """
-    Return (auto_links, manual_links) found on a repack/game page. auto_links
-    are direct-download hosts we resolve ourselves; manual_links are gated hosts
-    (gofile etc.) the user must finish in a browser. Handles protocol-relative
-    (//host/...) links too.
+    Return (auto, expand, manual) link lists found on a repack/game page:
+      auto   -- direct hosts we resolve 1:1 to a download
+      expand -- folder hosts (gofile) we expand into many download tasks
+      manual -- gated hosts (filecrypt/megadb/...) opened in the browser
+    Handles protocol-relative (//host/...) links too.
     """
     force = "steamrip.com" not in page_url  # steamrip links sit in static HTML
     page = _fetch_text(page_url, referer=page_url, force_browser=force)
-    auto, manual, seen = [], [], set()
+    auto, expand, manual, seen = [], [], [], set()
     for m in re.finditer(r'(?:https?:)?//[^\s"\'<>\\)]+', page):
         raw = m.group(0)
         low = raw.lower()
@@ -552,11 +555,85 @@ def extract_download_links(page_url):
         if url in seen:
             continue
         seen.add(url)
-        if any(h in low for h in _AUTO_HOSTS):
+        if any(h in low for h in _EXPAND_HOSTS):
+            expand.append(url)
+        elif any(h in low for h in _AUTO_HOSTS):
             auto.append(url)
         else:
             manual.append(url)
-    return auto, manual
+    return auto, expand, manual
+
+
+# --------------------------------------------------------------------------- #
+# gofile.io -- folders gate the API behind premium, but a dynamically computed
+# X-Website-Token (sha256 of UA + locale + token + 4h-slot + salt) still works.
+# A folder link expands into one download task per file, each carrying the
+# accountToken cookie the storage servers require.
+# --------------------------------------------------------------------------- #
+_GOFILE_SALT = "9844d94d963d30"
+
+
+def _gofile_wt(token):
+    slot = int(time.time()) // 14400
+    raw = f"{USER_AGENT}::en-US::{token}::{slot}::{_GOFILE_SALT}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _gofile_api(url, token=None):
+    headers = {"User-Agent": USER_AGENT, "X-Website-Token": _gofile_wt(token or ""),
+               "X-BL": "en-US"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    method = "POST" if url.endswith("/accounts") else "GET"
+    data = b"" if method == "POST" else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def gofile_expand(url):
+    """Resolve a gofile.io/d/<code> folder to [{url,name,headers,size}, ...]."""
+    m = re.search(r"gofile\.io/(?:d|download)/([A-Za-z0-9]+)", url)
+    if not m:
+        raise RuntimeError("not a gofile folder link")
+    token = _gofile_api("https://api.gofile.io/accounts")["data"]["token"]
+    cookie = {"Cookie": "accountToken=" + token}
+    items = []
+
+    def walk(code):
+        api = (f"https://api.gofile.io/contents/{code}"
+               "?cache=true&sortField=createTime&sortDirection=1")
+        data = _gofile_api(api, token)
+        if data.get("status") != "ok":
+            raise RuntimeError(f"gofile: {data.get('status')}")
+        for c in (data.get("data", {}).get("children") or {}).values():
+            if c.get("type") == "folder" and c.get("id"):
+                walk(c["id"])
+            elif c.get("type") == "file" and c.get("link"):
+                items.append({"url": c["link"],
+                              "name": c.get("name") or filename_from_url(c["link"]),
+                              "headers": cookie, "size": c.get("size")})
+
+    walk(m.group(1))
+    if not items:
+        raise RuntimeError("gofile: no files found (folder empty or premium-only)")
+    return items
+
+
+def _resolve_buzzheavier(url):
+    """buzzheavier.com/<id> -> direct link via its htmx /download endpoint."""
+    m = re.search(r"buzzheavier\.com/([A-Za-z0-9]+)", url)
+    if not m:
+        raise RuntimeError("not a buzzheavier link")
+    dl = f"https://buzzheavier.com/{m.group(1)}/download"
+    req = urllib.request.Request(dl, headers={
+        "User-Agent": USER_AGENT, "HX-Request": "true",
+        "HX-Current-URL": url, "Referer": url})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        link = resp.headers.get("HX-Redirect") or resp.headers.get("hx-redirect")
+    if not link:
+        raise RuntimeError("buzzheavier: no direct link returned")
+    return link
 
 
 def _resolve_pixeldrain(url):
@@ -596,6 +673,7 @@ _RESOLVERS = {
     "fuckingfast.co": _resolve_fuckingfast,
     "pixeldrain.com": _resolve_pixeldrain,
     "datanodes.to": _resolve_datanodes,
+    "buzzheavier": _resolve_buzzheavier,
 }
 
 
@@ -828,11 +906,12 @@ def notify(title, message):
 
 
 class Task:
-    def __init__(self, url, dest_dir):
+    def __init__(self, url, dest_dir, name=None, headers=None):
         self.url = url
-        self.name = filename_from_url(url)
+        self.name = name or filename_from_url(url)
         self.dest_dir = dest_dir
         self.path = os.path.join(dest_dir, self.name)
+        self.headers = dict(headers) if headers else {}  # extra request headers (e.g. gofile cookie)
         self.total = None
         self.done = 0
         self.speed = 0.0
@@ -854,11 +933,12 @@ class Task:
             "dest_dir": self.dest_dir,
             "total": self.total,
             "status": self.status,
+            "headers": self.headers,
         }
 
     @classmethod
     def from_dict(cls, d):
-        t = cls(d["url"], d["dest_dir"])
+        t = cls(d["url"], d["dest_dir"], headers=d.get("headers"))
         if d.get("name"):
             t.name = d["name"]
             t.path = os.path.join(t.dest_dir, t.name)
@@ -1055,7 +1135,7 @@ class Engine:
                 return
 
         existing = os.path.getsize(task.part_path) if os.path.exists(task.part_path) else 0
-        headers = {"User-Agent": USER_AGENT, "Referer": task.url}
+        headers = {"User-Agent": USER_AGENT, "Referer": task.url, **task.headers}
         if existing:
             headers["Range"] = f"bytes={existing}-"
 
@@ -1135,7 +1215,8 @@ class Engine:
         """Return total size if the server supports ranged GETs, else None."""
         try:
             req = urllib.request.Request(url, headers={
-                "User-Agent": USER_AGENT, "Referer": task.url, "Range": "bytes=0-0"})
+                "User-Agent": USER_AGENT, "Referer": task.url, "Range": "bytes=0-0",
+                **task.headers})
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 if resp.status != 206:
                     return None
@@ -1194,7 +1275,7 @@ class Engine:
             try:
                 req = urllib.request.Request(url, headers={
                     "User-Agent": USER_AGENT, "Referer": task.url,
-                    "Range": f"bytes={c}-{e}"})
+                    "Range": f"bytes={c}-{e}", **task.headers})
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp, \
                         open(part, "r+b") as f:
                     f.seek(c)
@@ -2087,25 +2168,46 @@ class App(tk.Tk):
         ).start()
 
     def _grab_game(self, game, auto_start):
+        title = game["title"]
         try:
-            auto, manual = extract_download_links(game["url"])
+            auto, expand, manual = extract_download_links(game["url"])
         except Exception as e:  # noqa
             self.events.put({"kind": "log", "task": None,
-                             "text": f"[browse] {game['title']}: {e}"})
+                             "text": f"[browse] {title}: {e}"})
             return
+        got = False
         if auto:
+            got = True
             self.events.put({"kind": "add_urls", "task": None, "urls": auto,
-                             "text": f"[browse] {game['title']}: {len(auto)} link(s)",
-                             "start": auto_start, "subdir": game["title"]})
+                             "text": f"[browse] {title}: {len(auto)} link(s)",
+                             "start": auto_start, "subdir": title})
+        for g in expand:  # gofile folders -> expand to direct tasks (in background)
+            got = True
+            self._expand_gofile(g, title, auto_start)
         if manual:
-            # Gated hosts (gofile/megadb/etc.) can't be auto-downloaded for free
-            # accounts -- open each in the browser so the user finishes there.
+            got = True
             self.events.put({"kind": "open_urls", "task": None, "urls": manual,
-                             "text": f"[browse] {game['title']}: opening "
-                                     f"{len(manual)} host page(s) in your browser"})
-        if not auto and not manual:
+                             "text": f"[browse] {title}: {len(manual)} link(s) need a "
+                                     f"browser (captcha/premium host) -- opening"})
+        if not got:
             self.events.put({"kind": "log", "task": None,
-                             "text": f"[browse] {game['title']}: no supported links found"})
+                             "text": f"[browse] {title}: no supported links found"})
+
+    def _expand_gofile(self, url, subdir, auto_start):
+        self.events.put({"kind": "log", "task": None,
+                         "text": f"[gofile] resolving folder for '{subdir}' ..."})
+
+        def work():
+            try:
+                items = gofile_expand(url)
+            except Exception as e:  # noqa
+                self.events.put({"kind": "log", "task": None,
+                                 "text": f"[gofile] {subdir}: {e}"})
+                return
+            self.events.put({"kind": "add_items", "task": None, "items": items,
+                             "subdir": subdir, "start": auto_start,
+                             "text": f"[gofile] {subdir}: {len(items)} file(s)"})
+        threading.Thread(target=work, daemon=True).start()
 
     # ----- queue management ----- #
     def _load_txt(self):
@@ -2122,12 +2224,17 @@ class App(tk.Tk):
         if not urls:
             messagebox.showwarning("No URLs", "Paste one or more http(s) URLs first.")
             return
-        # Index/release pages get scraped for file links in the background;
-        # everything else is queued directly.
+        # Sort pasted links: index/release pages -> scrape; gofile folders ->
+        # expand; everything else -> queue directly.
         index_pages = [u for u in urls if is_index_page(u)]
-        direct = [u for u in urls if not is_index_page(u)]
+        gofile = [u for u in urls if not is_index_page(u)
+                  and any(h in u.lower() for h in _EXPAND_HOSTS)]
+        direct = [u for u in urls if not is_index_page(u)
+                  and not any(h in u.lower() for h in _EXPAND_HOSTS)]
         if direct:
             self._queue_urls(direct)
+        for g in gofile:
+            self._expand_gofile(g, "", False)
         for p in index_pages:
             self._log(f"Grabbing links from {p} ...")
             threading.Thread(
@@ -2165,6 +2272,31 @@ class App(tk.Tk):
             added += 1
         if added:
             self._log(f"Queued {added} URL(s).")
+            self._save_state()
+        return added
+
+    def _queue_items(self, items, subdir=None):
+        """Queue pre-resolved downloads (url + name + headers), e.g. gofile files."""
+        base = self.dest_dir.get()
+        folder = os.path.join(base, sanitize(subdir)) if subdir else base
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            folder = base
+        existing = {t.url for t in self.tasks}
+        added = 0
+        for it in items:
+            if it["url"] in existing:
+                continue
+            t = Task(it["url"], folder, name=it.get("name"), headers=it.get("headers"))
+            if it.get("size"):
+                t.total = it["size"]
+            self.tasks.append(t)
+            self._insert_task_row(t)
+            existing.add(it["url"])
+            added += 1
+        if added:
+            self._log(f"Queued {added} file(s).")
             self._save_state()
         return added
 
@@ -2278,6 +2410,13 @@ class App(tk.Tk):
                     if ev.get("text"):
                         self._log(ev["text"])
                     added = self._queue_urls(ev["urls"], ev.get("subdir"))
+                    if ev.get("start") and added:
+                        self._start()
+                    dirty = True
+                elif kind == "add_items":
+                    if ev.get("text"):
+                        self._log(ev["text"])
+                    added = self._queue_items(ev["items"], ev.get("subdir"))
                     if ev.get("start") and added:
                         self._start()
                     dirty = True
@@ -2508,7 +2647,7 @@ class RepackBrowser(tk.Toplevel):
 
         self.auto_start = tk.BooleanVar(value=True)
         ttk.Checkbutton(self, text="Start downloading immediately when added "
-                        "(gated hosts like gofile open in your browser)",
+                        "(captcha-gated hosts like filecrypt open in your browser)",
                         variable=self.auto_start).pack(anchor="w", padx=8)
 
         self.tree = ttk.Treeview(self, columns=("title",), show="headings", height=18)
