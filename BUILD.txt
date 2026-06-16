@@ -1,0 +1,39 @@
+Building PyGet.exe
+==================
+
+Self-contained build (recommended) -- bundles 7-Zip, the Cloudflare client, the
+system-tray + drag-and-drop libs, so the recipient needs nothing installed:
+
+  python -m PyInstaller --noconfirm --onefile --windowed --name PyGet \
+    --collect-all curl_cffi \
+    --collect-all tkinterdnd2 \
+    --collect-all pystray \
+    --collect-all PIL \
+    --collect-all playwright \
+    --add-binary "C:/Program Files/7-Zip/7z.exe;." \
+    --add-binary "C:/Program Files/7-Zip/7z.dll;." \
+    --add-data   "C:/Program Files/7-Zip/License.txt;7-zip" \
+    downloader.py
+
+  Note on playwright: the pip package is bundled, but Chromium is NOT (it lives
+  in %USERPROFILE%\AppData\Local\ms-playwright after `playwright install
+  chromium`). The browser is only used as a Cloudflare/JS fallback; SteamRIP and
+  FitGirl work without it.
+
+Minimal build (no tray / drag-drop / bundled 7-Zip):
+
+  python -m PyInstaller --noconfirm --onefile --windowed --name PyGet \
+    --collect-all curl_cffi downloader.py
+
+Notes:
+  - 7z.exe + 7z.dll MUST both be bundled together -- RAR extraction needs the dll.
+  - The "src;dest" separator is ';' on Windows. '.' = the bundle root, where
+    find_7zip() looks first (sys._MEIPASS).
+  - Optional and NOT bundled: playwright (headless-browser Cloudflare fallback).
+    Install + `playwright install chromium` on the target if you ever need it.
+  - 7-Zip is free software (LGPL + unRAR restriction); License.txt is included
+    to satisfy redistribution.
+  - Kill any running PyGet.exe before rebuilding (it locks dist/PyGet.exe).
+
+Rebuild from the saved spec instead:  python -m PyInstaller PyGet.spec
+The build/ folder is disposable; PyGet.exe lands in dist/.

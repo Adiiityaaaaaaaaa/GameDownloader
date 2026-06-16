@@ -1,0 +1,9 @@
+# Required to resolve Cloudflare-protected host pages (e.g. fuckingfast.co).
+# Impersonates a real Chrome TLS fingerprint so the page loads instead of 403.
+# Without it the app still runs and direct links still work; only host-page
+# resolution is disabled.
+curl_cffi
+
+# OPTIONAL last-resort Cloudflare fallback. Only needed if curl_cffi ever stops
+# passing the challenge. After installing, also run:  playwright install chromium
+# playwright
