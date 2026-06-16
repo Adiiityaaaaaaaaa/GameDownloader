@@ -490,8 +490,10 @@ def _steamrip_all():
         return _steamrip_cache
     h = _fetch_text(STEAMRIP_BASE + "/games-list/", referer=STEAMRIP_BASE + "/")
     games, seen = [], set()
+    # Slugs may carry a version/suffix after "free-download" (e.g.
+    # /alan-wake-2-free-download-v12/, /...-free-download-m1/), so match loosely.
     for m in re.finditer(
-        r'<a[^>]+href="((?:https://steamrip\.com)?/[a-z0-9-]+-free-download/?)"[^>]*>(.*?)</a>',
+        r'<a[^>]+href="((?:https://steamrip\.com)?/[a-z0-9-]*free-download[a-z0-9-]*/?)"[^>]*>(.*?)</a>',
         h, re.S,
     ):
         url = m.group(1)
