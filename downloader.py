@@ -2593,5 +2593,55 @@ class RepackBrowser(tk.Toplevel):
         self._set_status(f"Added {len(games)} game(s) to the download queue.")
 
 
+def _run_selftest():
+    """Headless check that 7-Zip extraction works in this build (esp. frozen exe).
+
+    Writes results to pyget_selftest.txt next to the program and exits. Run with:
+        PyGet.exe --selftest
+    """
+    import tempfile
+    import queue as _queue
+    lines = [
+        f"frozen={getattr(sys, 'frozen', False)}",
+        f"_MEIPASS={getattr(sys, '_MEIPASS', '-')}",
+        f"SEVEN_ZIP={SEVEN_ZIP}",
+        f"7z exists={bool(SEVEN_ZIP) and os.path.isfile(SEVEN_ZIP)}",
+    ]
+    try:
+        work = tempfile.mkdtemp()
+        src = os.path.join(work, "p.dat")
+        with open(src, "wb") as f:
+            f.write(os.urandom(1024 * 1024))
+        arch = os.path.join(work, "t.7z")
+        r = subprocess.run([SEVEN_ZIP, "a", arch, src],
+                           capture_output=True, creationflags=CREATE_NO_WINDOW)
+        lines.append(f"create rc={r.returncode}")
+
+        eng = Engine(_queue.Queue())
+        t = Task("http://x/t.7z", work)
+        t.name, t.path, t.status = "t.7z", arch, "Done"
+        eng.tasks = [t]
+        seen = []
+        base_emit = eng.emit
+        eng.emit = lambda kind, task=None, **e: (
+            seen.append(task.status) if (kind == "update" and task) else None,
+            base_emit(kind, task, **e))[1]
+        eng._extract(t)
+        lines += [
+            f"saw_verifying={'yes' if any(s.startswith('Verifying') for s in seen) else 'no'}",
+            f"saw_extracting={'yes' if any(s.startswith('Extracting') for s in seen) else 'no'}",
+            f"final_status={t.status}",
+            f"extracted_ok={os.path.isfile(os.path.join(work, '_extracted', 'p.dat'))}",
+            "RESULT=" + ("PASS" if t.status == "Extracted" else "FAIL"),
+        ]
+    except Exception as e:  # noqa
+        lines.append(f"ERROR={type(e).__name__}: {e}")
+    with open(os.path.join(app_dir(), "pyget_selftest.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    if "--selftest" in sys.argv:
+        _run_selftest()
+    else:
+        App().mainloop()
