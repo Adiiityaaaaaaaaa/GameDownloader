@@ -600,6 +600,8 @@ def gofile_expand(url):
     cookie = {"Cookie": "accountToken=" + token}
     items = []
 
+    top = m.group(1)
+
     def walk(code):
         api = (f"https://api.gofile.io/contents/{code}"
                "?cache=true&sortField=createTime&sortDirection=1")
@@ -612,12 +614,24 @@ def gofile_expand(url):
             elif c.get("type") == "file" and c.get("link"):
                 items.append({"url": c["link"],
                               "name": c.get("name") or filename_from_url(c["link"]),
-                              "headers": cookie, "size": c.get("size")})
+                              "headers": cookie, "size": c.get("size"),
+                              "gofile_code": top})
 
-    walk(m.group(1))
+    walk(top)
     if not items:
         raise RuntimeError("gofile: no files found (folder empty or premium-only)")
     return items
+
+
+def gofile_refresh(code, name):
+    """Re-resolve a gofile folder and return the live {url, headers} for `name`."""
+    items = gofile_expand(f"https://gofile.io/d/{code}")
+    for it in items:
+        if it["name"] == name:
+            return it
+    if len(items) == 1:
+        return items[0]
+    raise RuntimeError(f"gofile: file '{name}' not found in folder")
 
 
 def _resolve_buzzheavier(url):
@@ -912,6 +926,7 @@ class Task:
         self.dest_dir = dest_dir
         self.path = os.path.join(dest_dir, self.name)
         self.headers = dict(headers) if headers else {}  # extra request headers (e.g. gofile cookie)
+        self.gofile_code = None  # if set, re-resolve a fresh gofile link each attempt
         self.total = None
         self.done = 0
         self.speed = 0.0
@@ -934,6 +949,7 @@ class Task:
             "total": self.total,
             "status": self.status,
             "headers": self.headers,
+            "gofile_code": self.gofile_code,
         }
 
     @classmethod
@@ -942,6 +958,7 @@ class Task:
         if d.get("name"):
             t.name = d["name"]
             t.path = os.path.join(t.dest_dir, t.name)
+        t.gofile_code = d.get("gofile_code")
         t.total = d.get("total")
         status = d.get("status", "Queued")
         segs = t.part_path + ".segs"
@@ -1111,6 +1128,16 @@ class Engine:
 
     def _attempt_download(self, task):
         """One download attempt. Raises on failure (the caller decides to retry)."""
+        # gofile store links + tokens are short-lived; re-resolve the folder fresh
+        # on every attempt so a stale/expired link doesn't get stuck retrying.
+        if task.gofile_code:
+            try:
+                fresh = gofile_refresh(task.gofile_code, task.name)
+            except Exception as e:  # noqa
+                raise TransientError(f"gofile re-resolve: {e}")
+            task.url = fresh["url"]
+            task.headers = fresh.get("headers", {})
+
         # Resolve a host page link into a real direct file link. Host pages hand
         # out time-limited links, so resolve on every attempt (incl. resumes).
         download_url = resolve_to_direct(task.url)
@@ -1144,6 +1171,12 @@ class Engine:
         self.emit("update", task)
 
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            # A real file is a binary stream; an HTML body means the host bounced
+            # us (gofile homepage on a stale token, rate-limit, etc.) -> retry.
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if "text/html" in ctype:
+                raise TransientError("host returned a web page, not the file "
+                                     "(stale link / rate-limited)")
             if resp.status == 206:  # partial -> resuming
                 cr = resp.headers.get("Content-Range", "")
                 m = re.search(r"/(\d+)$", cr)
@@ -2289,6 +2322,7 @@ class App(tk.Tk):
             if it["url"] in existing:
                 continue
             t = Task(it["url"], folder, name=it.get("name"), headers=it.get("headers"))
+            t.gofile_code = it.get("gofile_code")
             if it.get("size"):
                 t.total = it["size"]
             self.tasks.append(t)
