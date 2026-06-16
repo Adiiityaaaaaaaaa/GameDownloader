@@ -1899,6 +1899,16 @@ class App(tk.Tk):
         except Exception as e:  # noqa
             self._log(f"[open] {e}")
 
+    def _open_url(self, url):
+        """Open a URL in the default browser (NOT via _open_path -- that would
+        mangle the URL with os.path.dirname and drop the last path segment)."""
+        import webbrowser
+        try:
+            if not webbrowser.open(url):
+                os.startfile(url)
+        except Exception as e:  # noqa
+            self._log(f"[open] {e}")
+
     # ----- queue reorder ----- #
     def _move(self, direction):
         """Move selected top-level rows up (-1) or down (+1) in the queue."""
@@ -2281,7 +2291,7 @@ class App(tk.Tk):
                     if ev.get("text"):
                         self._log(ev["text"])
                     for u in ev["urls"]:
-                        self._open_path(u)
+                        self._open_url(u)
                 elif kind == "all_done":
                     self.start_btn.config(state="normal")
                     n_done = sum(1 for t in self.tasks
