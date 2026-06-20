@@ -2471,6 +2471,39 @@ class App(tk.Tk):
         if d:
             self.dest_dir.set(d)
 
+    def _resume_existing(self, urls):
+        """Re-grab/re-add of links already in the queue: give feedback and resume.
+
+        Without this, clicking "download" on a game that's already queued (e.g. a
+        paused or errored task, or a second click) silently does nothing -- the
+        links dedupe to zero new tasks and the start is skipped. Instead we tell
+        the user and kick the matching tasks back to life.
+        """
+        urlset = set(urls)
+        matches = [t for t in self.tasks if t.url in urlset]
+        if not matches:
+            self._log("[browse] nothing new to add.")
+            return
+        if all(t.status in ("Done", "Extracted") for t in matches):
+            self._log(f"[browse] already downloaded ({len(matches)} file(s)) -- "
+                      "use right-click > Re-download to fetch again.")
+            return
+        active = ("Downloading", "Connecting")
+        resumable = [t for t in matches
+                     if t.status not in _TERMINAL_STATUSES and t.status not in active]
+        if not resumable:
+            self._log("[browse] already downloading.")
+            return
+        self._log(f"[browse] already in the queue -- resuming {len(resumable)} task(s).")
+        for t in resumable:
+            t.paused = False
+            t.status = "Queued"
+            if not t.tree_id or not self.tree.exists(t.tree_id):
+                self._insert_task_row(t)  # restore a row that went missing
+            else:
+                self._refresh_row(t)
+        self._start()
+
     # ----- run control ----- #
     def _start(self):
         resumable = ("Error", "HTTP", "Failed", "Resolve failed", "Retry", "Missing")
@@ -2536,15 +2569,21 @@ class App(tk.Tk):
                     if ev.get("text"):
                         self._log(ev["text"])
                     added = self._queue_urls(ev["urls"], ev.get("subdir"))
-                    if ev.get("start") and added:
-                        self._start()
+                    if ev.get("start"):
+                        if added:
+                            self._start()
+                        else:
+                            self._resume_existing(ev["urls"])
                     dirty = True
                 elif kind == "add_items":
                     if ev.get("text"):
                         self._log(ev["text"])
                     added = self._queue_items(ev["items"], ev.get("subdir"))
-                    if ev.get("start") and added:
-                        self._start()
+                    if ev.get("start"):
+                        if added:
+                            self._start()
+                        else:
+                            self._resume_existing([it["url"] for it in ev["items"]])
                     dirty = True
                 elif kind == "rechecked":
                     self._log(f"Re-check complete ({ev.get('n', 0)} file(s)).")
