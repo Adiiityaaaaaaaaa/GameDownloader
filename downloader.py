@@ -21,6 +21,7 @@ import re
 import sys
 import json
 import time
+import errno
 import html
 import queue
 import hashlib
@@ -66,6 +67,10 @@ def _is_retryable(exc):
         return True
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in (408, 425, 429, 500, 502, 503, 504)
+    # A full disk or exceeded quota won't fix itself by retrying -- fail fast so
+    # the user sees *why* instead of a download that silently sticks at "Queued".
+    if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return False
     # URLError, socket.timeout, ConnectionReset, and most other I/O are OSError.
     return isinstance(exc, (urllib.error.URLError, TimeoutError, OSError))
 
@@ -1198,9 +1203,18 @@ class Engine:
                     return
                 permanent = not _is_retryable(e)
                 if permanent or attempt >= self.max_attempts:
-                    label = "Failed" if not permanent else "Error"
-                    task.status = f"{label}: {e}" if str(e) else f"{label}: {e.__class__.__name__}"
-                    self.emit("log", text=f"[{task.name}] giving up: {e}")
+                    if isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT):
+                        free = free_space(task.dest_dir)
+                        need = human(task.total) if task.total else "the file"
+                        msg = (f"No disk space (need {need}"
+                               + (f", {human(free)} free" if free is not None else "")
+                               + ")")
+                        task.status = f"Failed: {msg}"
+                        self.emit("log", text=f"[{task.name}] {msg} -- free up space and retry")
+                    else:
+                        label = "Failed" if not permanent else "Error"
+                        task.status = f"{label}: {e}" if str(e) else f"{label}: {e.__class__.__name__}"
+                        self.emit("log", text=f"[{task.name}] giving up: {e}")
                     self.emit("update", task)
                     return
                 delay = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
