@@ -525,13 +525,50 @@ SITES = {
 
 
 # Hosts we resolve to a real direct download (single link -> single task).
-_AUTO_HOSTS = ("fuckingfast.co", "pixeldrain.com", "datanodes.to", "buzzheavier")
+_AUTO_HOSTS = ("fuckingfast.co", "pixeldrain.com", "datanodes.to", "buzzheavier",
+               "bzzhr.to", "fileditchfiles.me", "fileditch.com")
 # Hosts that are a *folder* we expand into many direct download tasks.
 _EXPAND_HOSTS = ("gofile.io",)
 # Hosts we still can't beat (premium/JS/captcha) -- opened in the browser.
 _MANUAL_HOSTS = ("megadb.net", "1fichier.com", "filecrypt", "akirabox",
                  "mega.nz", "mediafire.com")
 _ALL_HOSTS = _AUTO_HOSTS + _EXPAND_HOSTS + _MANUAL_HOSTS
+
+# Some pages (e.g. SteamRIP game pages) list several download buttons that are
+# all *mirrors* of the same file on different hosts -- unlike a FitGirl release,
+# where each link is a different archive part. For a mirror page we pick ONE
+# source instead of downloading the same game from every host. Lower index =
+# more reliable / preferred.
+_HOST_PREFERENCE = ("fileditch", "bzzhr.to", "buzzheavier", "datanodes",
+                    "pixeldrain", "fuckingfast", "gofile")
+_MIRROR_HOSTS = ("steamrip.com",)
+
+
+def is_mirror_page(url):
+    """True if a page's many download links are mirrors of one file (pick one)."""
+    host = urlparse(url).netloc.lower()
+    return any(h in host for h in _MIRROR_HOSTS)
+
+
+def best_mirror(auto, expand, manual):
+    """From the (auto, expand, manual) link sets pick the single best source.
+
+    Returns (kind, url) where kind is 'auto' | 'expand' | 'manual', or None when
+    there's nothing to download. Used for mirror pages so we grab a game once.
+    """
+    candidates = ([("auto", u) for u in auto]
+                  + [("expand", u) for u in expand]
+                  + [("manual", u) for u in manual])
+
+    def rank(item):
+        low = item[1].lower()
+        for i, h in enumerate(_HOST_PREFERENCE):
+            if h in low:
+                return i
+        return len(_HOST_PREFERENCE)
+
+    candidates.sort(key=rank)
+    return candidates[0] if candidates else None
 
 
 def extract_download_links(page_url):
@@ -635,19 +672,63 @@ def gofile_refresh(code, name):
 
 
 def _resolve_buzzheavier(url):
-    """buzzheavier.com/<id> -> direct link via its htmx /download endpoint."""
-    m = re.search(r"buzzheavier\.com/([A-Za-z0-9]+)", url)
+    """buzzheavier (buzzheavier.com / bzzhr.to) /<id> -> direct link.
+
+    The page exposes its real download endpoint through an htmx `hx-get`
+    attribute carrying a short-lived token (?t=...); hitting `/download` without
+    it just 204-redirects back to the page. We pull that tokenised endpoint out
+    of the page and call it -- the server answers 204 with the real file URL in
+    its HX-Redirect header. Falls back to the old tokenless endpoint for legacy
+    links.
+    """
+    m = re.search(r"(?:buzzheavier\.com|bzzhr\.to)/([A-Za-z0-9]+)", url)
     if not m:
         raise RuntimeError("not a buzzheavier link")
-    dl = f"https://buzzheavier.com/{m.group(1)}/download"
+    base = "https://" + urlparse(url).netloc
+
+    dl = None
+    try:
+        page = _fetch_text(url, referer=url)
+        mm = re.search(r'hx-get="(/[^"]*?/download\?t=[^"&]+)"', page)
+        if mm:
+            dl = base + html.unescape(mm.group(1))
+    except Exception:  # noqa - fall back to the tokenless endpoint below
+        pass
+    if not dl:
+        dl = f"{base}/{m.group(1)}/download"
+
     req = urllib.request.Request(dl, headers={
         "User-Agent": USER_AGENT, "HX-Request": "true",
         "HX-Current-URL": url, "Referer": url})
     with urllib.request.urlopen(req, timeout=30) as resp:
         link = resp.headers.get("HX-Redirect") or resp.headers.get("hx-redirect")
-    if not link:
+    # A redirect back to the page itself means "no link" (stale/expired token).
+    if not link or link.rstrip("/") == url.rstrip("/"):
         raise RuntimeError("buzzheavier: no direct link returned")
     return link
+
+
+def _resolve_fileditch(url):
+    """fileditch page (fileditchfiles.me / fileditch.com) -> direct CDN link.
+
+    FileDitch serves an interstitial HTML page whose download button points at a
+    time-limited signed URL on a separate CDN host. Pull that href out (it's the
+    anchor carrying the `download` attribute) and un-escape its &amp; entities.
+    """
+    page = _fetch_text(url, referer=url)
+    m = re.search(r'<a[^>]+href="([^"]+)"[^>]*\bdownload\b', page, re.I)
+    if not m:
+        # Fall back to any archive-looking link that isn't the abuse-report URL.
+        for cand in re.findall(r'href="(https://[^"]+\.(?:rar|zip|7z|bin)[^"]*)"',
+                               page, re.I):
+            if "abuse" not in cand.lower():
+                m = re.match(r"(.*)", cand)
+                break
+    if not m:
+        if _looks_like_challenge(page):
+            raise RuntimeError("fileditch: blocked by Cloudflare challenge")
+        raise RuntimeError("fileditch: direct link not found (markup changed?)")
+    return html.unescape(m.group(1))
 
 
 def _resolve_pixeldrain(url):
@@ -688,6 +769,9 @@ _RESOLVERS = {
     "pixeldrain.com": _resolve_pixeldrain,
     "datanodes.to": _resolve_datanodes,
     "buzzheavier": _resolve_buzzheavier,
+    "bzzhr.to": _resolve_buzzheavier,
+    "fileditchfiles.me": _resolve_fileditch,
+    "fileditch.com": _resolve_fileditch,
 }
 
 
@@ -2208,6 +2292,14 @@ class App(tk.Tk):
             self.events.put({"kind": "log", "task": None,
                              "text": f"[browse] {title}: {e}"})
             return
+        # On mirror pages (SteamRIP) every button is the same file on a different
+        # host -- pick one so we don't download the whole game three times.
+        if is_mirror_page(game["url"]):
+            chosen = best_mirror(auto, expand, manual)
+            auto, expand, manual = [], [], []
+            if chosen:
+                kind, url = chosen
+                {"auto": auto, "expand": expand, "manual": manual}[kind].append(url)
         got = False
         if auto:
             got = True

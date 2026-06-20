@@ -13,8 +13,9 @@ downloads, verifies, and extracts — with a built-in repack browser.
   direct link past the Cloudflare gate (via `curl_cffi`, with a headless-browser
   fallback when `playwright` is installed). Also: `pixeldrain`, `datanodes`.
 - **Repack browser** — browse/search **FitGirl**, **DODI**, **SteamRIP** catalogs
-  and one-click a game. FitGirl auto-downloads its fuckingfast links; gated hosts
-  (gofile/megadb) open in your browser to finish there.
+  and one-click a game. FitGirl auto-downloads its fuckingfast links; SteamRIP
+  auto-downloads via its FileDitch / buzzheavier mirrors (one mirror per game,
+  not all three); remaining gated hosts open in your browser to finish there.
 - **Multi-part archive grouping** in the UI with per-group + per-file ETA and a
   visual progress bar.
 - **Auto-extract** completed archives with 7-Zip (bundled in the release exe),
@@ -38,8 +39,10 @@ see [BUILD.txt](BUILD.txt)).
 
 ## Notes / limitations
 
-- **gofile** (SteamRIP's main host) now requires a paid account for folder
-  downloads, so those links open in your browser rather than auto-downloading.
+- **SteamRIP** pages offer the same game on three mirrors (FileDitch,
+  buzzheavier `bzzhr.to`, and gofile). The app picks one — preferring FileDitch,
+  then buzzheavier — and resolves it to a direct, resumable link. gofile is used
+  only as a last resort, since its folders can require a paid account.
 - **DODI** sits behind a Cloudflare gate that blocks automated requests
   (including headless browsers).
 - For downloads you have the right to download only.
