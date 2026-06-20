@@ -961,6 +961,46 @@ def _segs_done(segs_path):
         return None
 
 
+def _preallocate(fh, total):
+    """Reserve a segmented download's .part file WITHOUT a multi-minute zero-fill.
+
+    On Windows/NTFS, extending a file (e.g. truncate() to 100 GB) physically
+    writes that many zero bytes, which blocks for tens of minutes on a big game
+    and looks like a frozen "Queued" download. Marking the file sparse first
+    tells NTFS the unwritten regions are holes, so there's nothing to zero --
+    the segment writers just seek to their offsets and fill their ranges.
+    Elsewhere, truncate() already creates a sparse file instantly.
+    """
+    if not total:
+        return
+    if sys.platform != "win32":
+        fh.truncate(total)
+        return
+    try:
+        import msvcrt
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Explicit argtypes matter: a 64-bit file HANDLE silently truncates to
+        # 32 bits otherwise, the call fails, and we'd fall back to zero-filling.
+        k32.DeviceIoControl.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+            wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID]
+        k32.DeviceIoControl.restype = wintypes.BOOL
+        FSCTL_SET_SPARSE = 0x000900C4
+        h = wintypes.HANDLE(msvcrt.get_osfhandle(fh.fileno()))
+        br = wintypes.DWORD()
+        if k32.DeviceIoControl(h, FSCTL_SET_SPARSE, None, 0, None, 0,
+                               ctypes.byref(br), None):
+            return  # sparse: leave the file empty, writers extend it as holes
+    except Exception:  # noqa
+        pass
+    # Couldn't mark it sparse -- fall back to a plain (slow) pre-size so the
+    # segment writers at least have a file sized for their seeks.
+    fh.truncate(total)
+
+
 def free_space(path):
     """Bytes free on the drive that holds `path` (walks up to an existing dir)."""
     probe = path
@@ -1389,8 +1429,7 @@ class Engine:
                 plan = None
         if plan is None:
             with open(part, "wb") as f:
-                if total:
-                    f.truncate(total)
+                _preallocate(f, total)
             seg = total // n
             plan = [[i * seg, i * seg, (total - 1 if i == n - 1 else (i + 1) * seg - 1)]
                     for i in range(n)]
