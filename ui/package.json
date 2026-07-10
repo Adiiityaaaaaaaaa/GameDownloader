@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "electron": "electron .",
     "electron:dev": "vite build && electron .",
-    "package:win": "vite build && npx @electron/packager . RIPTIDE --platform=win32 --arch=x64 --out=electron-release --overwrite --extra-resource=backend --ignore=\"node_modules\" --ignore=\"^/src\" --ignore=\"^/backend\" --ignore=\"^/electron-release\""
+    "package:win": "vite build && npx @electron/packager . RIPTIDE --platform=win32 --arch=x64 --out=electron-release --overwrite --extra-resource=backend --ignore=\"node_modules\" --ignore=\"^/src\" --ignore=\"^/backend\" --ignore=\"^/electron-release\"",
+    "dist": "vite build && electron-builder --win portable"
   },
   "dependencies": {
     "lucide-react": "^0.575.0",
@@ -22,9 +23,19 @@
     "@tailwindcss/vite": "^4.2.1",
     "@vitejs/plugin-react": "^5.2.0",
     "electron": "^43.1.0",
+    "electron-builder": "^25.1.8",
     "tailwindcss": "^4.2.1",
     "tw-animate-css": "^1.3.4",
     "typescript": "^5.8.3",
     "vite": "^8.0.16"
+  },
+  "build": {
+    "appId": "com.pyget.riptide",
+    "productName": "RIPTIDE",
+    "directories": { "output": "release" },
+    "files": ["dist/**/*", "electron/**/*", "public/favicon.ico", "package.json"],
+    "extraResources": [{ "from": "backend", "to": "backend" }],
+    "win": { "target": "portable", "icon": "public/favicon.ico" },
+    "portable": { "artifactName": "RIPTIDE-portable.exe" }
   }
 }
