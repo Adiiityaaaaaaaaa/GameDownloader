@@ -51,7 +51,20 @@ def _norm(s):
 
 
 def _clean_title(t):
-    return re.sub(r"\s*Free Download.*$", "", t or "", flags=re.I).strip() or (t or "")
+    """Reduce a repack listing title to the bare game name -- for display and for
+    matching against Steam. Handles SteamRIP ('... Free Download (v1.2)'),
+    FitGirl ('Name - Edition, v1.2 + N DLCs') and DODI ('610- Name (v...)').
+    """
+    t = (t or "").strip()
+    orig = t
+    t = re.sub(r"\s*Free Download.*$", "", t, flags=re.I)   # SteamRIP tail
+    t = re.sub(r"^\s*\d+[-.)]\s*", "", t)                     # DODI "610- " prefix
+    t = re.split(r"\s+[–—-]\s+", t)[0]              # " - Edition" (spaced dash)
+    # Cut at a version / build / DLC / bracket tail.
+    t = re.split(r"(?:,|\s)+(?:v\d|Build\b|\(|\[|\+\s*\d|\bAll DLC)",
+                 t, flags=re.I)[0]
+    t = t.strip(" ,-–—")
+    return t or orig
 
 
 def _get_json(url):
@@ -76,27 +89,54 @@ def _pick_appid(cands, nq):
     return None
 
 
+_EDITION = re.compile(
+    r"\b(?:ultimate|deluxe|complete|definitive|enhanced|gold|goty|premium|"
+    r"standard|digital deluxe|game of the year)\s+edition\b", re.I)
+
+
+def _resolve_appid(query):
+    """Resolve one query string to a Steam appid via official endpoints, or None."""
+    nq = _norm(query)
+    if not nq:
+        return None
+    try:  # community app search -- precise, games only
+        d = _get_json("https://steamcommunity.com/actions/SearchApps/" + quote(query))
+        a = _pick_appid([(it["appid"], it.get("name", "")) for it in d], nq)
+        if a:
+            return a
+    except Exception:  # noqa
+        pass
+    try:  # storefront search -- broader, guarded against false positives
+        d = _get_json("https://store.steampowered.com/api/storesearch/?term="
+                      + quote(query) + "&cc=us&l=en")
+        items = d.get("items") or []
+        return _pick_appid([(it["id"], it.get("name", "")) for it in items], nq)
+    except Exception:  # noqa
+        return None
+
+
 def steam_cover(title):
-    """Return a Steam poster URL for `title`, or None. Cached per title."""
+    """Return an official Steam poster URL for `title`, or None. Cached per title.
+
+    Art comes from Steam's public store CDN (a legitimate first-party source),
+    never scraped from the repack site. Tries the cleaned name, then the name
+    with any edition suffix stripped, then just the part before a ':' subtitle.
+    """
     key = _clean_title(title)
     with _COVER_LOCK:
         if key in _COVER_CACHE:
             return _COVER_CACHE[key]
-    nq = _norm(key)
+    variants = [key]
+    noed = _EDITION.sub("", key).strip(" :,-–—")
+    if noed and noed != key:
+        variants.append(noed)
+    if ":" in noed:
+        variants.append(noed.split(":")[0].strip())
     appid = None
-    try:  # community app search -- precise, games only
-        d = _get_json("https://steamcommunity.com/actions/SearchApps/" + quote(key))
-        appid = _pick_appid([(it["appid"], it.get("name", "")) for it in d], nq)
-    except Exception:  # noqa
-        pass
-    if not appid:
-        try:  # storefront search -- broader, guarded against false positives
-            d = _get_json("https://store.steampowered.com/api/storesearch/?term="
-                          + quote(key) + "&cc=us&l=en")
-            items = d.get("items") or []
-            appid = _pick_appid([(it["id"], it.get("name", "")) for it in items], nq)
-        except Exception:  # noqa
-            pass
+    for q in variants:
+        appid = _resolve_appid(q)
+        if appid:
+            break
     url = _CDN.format(appid) if appid else None
     with _COVER_LOCK:
         _COVER_CACHE[key] = url
@@ -352,8 +392,8 @@ class Controller:
                  "dodi": "DODI"}.get(site, site)
         fetch = dl.SITES[site][1]
         games = fetch(page=page, query=q or None)
-        return [{"title": g["title"], "url": g["url"], "source": label}
-                for g in games]
+        return [{"title": g["title"], "clean": _clean_title(g["title"]),
+                 "url": g["url"], "source": label} for g in games]
 
 
 _SOURCE_HOSTS = [
@@ -393,7 +433,7 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self._cors()
         self.end_headers()

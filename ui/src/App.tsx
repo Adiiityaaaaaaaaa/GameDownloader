@@ -145,7 +145,7 @@ export default function Index() {
   async function addGame(r: SearchResult) {
     setAdding((m) => ({ ...m, [r.url]: true }));
     try {
-      await pyget.add(r.url, r.title);
+      await pyget.add(r.url, r.clean);
       setTab("queue");
     } finally {
       setTimeout(() => setAdding((m) => ({ ...m, [r.url]: false })), 1500);
@@ -272,7 +272,7 @@ export default function Index() {
                 {results.map((g) => (
                   <div key={g.url} className="group cursor-pointer" onClick={() => addGame(g)}>
                     <div className="relative">
-                      <Cover title={cleanTitle(g.title)} hue={hueOf(g.title)} />
+                      <Cover title={g.clean} hue={hueOf(g.clean)} />
                       <button className="absolute inset-x-2 bottom-2 flex translate-y-2 items-center justify-center gap-1.5 rounded-sm bg-primary py-1.5 text-mono text-[11px] font-semibold uppercase tracking-widest text-primary-foreground opacity-0 transition group-hover:translate-y-0 group-hover:opacity-100">
                         {adding[g.url] ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
                         {adding[g.url] ? "queued" : "download"}
@@ -280,7 +280,7 @@ export default function Index() {
                     </div>
                     <div className="mt-2 flex items-center justify-between gap-2">
                       <div className="min-w-0">
-                        <div className="truncate font-sans text-sm font-medium">{cleanTitle(g.title)}</div>
+                        <div className="truncate font-sans text-sm font-medium">{g.clean}</div>
                         <div className="text-mono text-[10px] text-muted-foreground">{g.source}</div>
                       </div>
                       <SourcePill s={g.source} />
@@ -394,9 +394,4 @@ export default function Index() {
 function nowClock(): string {
   const d = new Date();
   return d.toTimeString().slice(0, 8);
-}
-
-// SteamRIP titles look like "Foo Free Download (v1.2)"; trim the boilerplate.
-function cleanTitle(t: string): string {
-  return t.replace(/\s*Free Download.*$/i, "").trim() || t;
 }

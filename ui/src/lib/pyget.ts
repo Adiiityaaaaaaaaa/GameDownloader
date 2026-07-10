@@ -19,7 +19,12 @@ export type Task = {
   source: string;
 };
 
-export type SearchResult = { title: string; url: string; source: string };
+export type SearchResult = {
+  title: string;
+  clean: string;
+  url: string;
+  source: string;
+};
 
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API}${path}`, {
