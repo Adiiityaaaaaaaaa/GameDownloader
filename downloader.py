@@ -124,6 +124,19 @@ def win_perf_release():
         _timer_period_set = False
 
 
+# Optional stream-extract backend (libarchive). Absent -> the feature just
+# disables itself; normal download-then-extract is unaffected.
+try:
+    import streaming as _streaming
+except Exception:  # noqa - requests/libarchive may be missing in some environments
+    _streaming = None
+
+
+def stream_extract_available():
+    """True if archives can be extracted straight from the transfer."""
+    return _streaming is not None and _streaming.is_available()
+
+
 class TransientError(Exception):
     """A failure worth retrying (timeout, dropped connection, 5xx, 429)."""
 
@@ -1013,6 +1026,17 @@ def is_extraction_entrypoint(filename):
     )
 
 
+def is_single_volume_archive(filename):
+    """True if `filename` is a lone archive we can stream-extract on the fly.
+
+    Split sets (.part01.rar, .7z.001, .rNN, .zNN) need every volume present at
+    once, so they can't be piped from a single connection -- those fall back to
+    the normal download-then-extract path.
+    """
+    return (archive_group(filename) is None
+            and filename.lower().endswith((".rar", ".zip", ".7z")))
+
+
 # --------------------------------------------------------------------------- #
 # Download task model
 # --------------------------------------------------------------------------- #
@@ -1131,13 +1155,14 @@ def notify(title, message):
 
 
 class Task:
-    def __init__(self, url, dest_dir, name=None, headers=None):
+    def __init__(self, url, dest_dir, name=None, headers=None, stream=False):
         self.url = url
         self.name = name or filename_from_url(url)
         self.dest_dir = dest_dir
         self.path = os.path.join(dest_dir, self.name)
         self.headers = dict(headers) if headers else {}  # extra request headers (e.g. gofile cookie)
         self.gofile_code = None  # if set, re-resolve a fresh gofile link each attempt
+        self.stream = stream  # extract straight from the transfer (no stored archive)
         self.total = None
         self.done = 0
         self.speed = 0.0
@@ -1161,11 +1186,13 @@ class Task:
             "status": self.status,
             "headers": self.headers,
             "gofile_code": self.gofile_code,
+            "stream": self.stream,
         }
 
     @classmethod
     def from_dict(cls, d):
-        t = cls(d["url"], d["dest_dir"], headers=d.get("headers"))
+        t = cls(d["url"], d["dest_dir"], headers=d.get("headers"),
+                stream=bool(d.get("stream")))
         if d.get("name"):
             t.name = d["name"]
             t.path = os.path.join(t.dest_dir, t.name)
@@ -1373,6 +1400,16 @@ class Engine:
             self.emit("completed", task)
             return
 
+        # Stream-extract: pipe the archive through libarchive and write only the
+        # extracted files, never storing the .rar (peak disk ~= extracted size).
+        # Single-volume archives only; needs the libarchive backend.
+        if task.stream and is_single_volume_archive(task.name):
+            if stream_extract_available():
+                self._stream_download(task, download_url)
+                return
+            self.emit("log", text=f"[{task.name}] stream-extract unavailable "
+                                   "(libarchive missing) -- downloading normally")
+
         # Multi-connection (segmented) path -- only when enabled and the server
         # supports ranged requests. Falls back to single-stream otherwise.
         if self.connections > 1:
@@ -1460,6 +1497,71 @@ class Engine:
         os.replace(task.part_path, task.path)  # atomic publish under final name
         task.status = "Done"
         task.speed = 0
+        self.emit("update", task)
+        self.emit("completed", task)
+
+    # ----- stream-extract (download + extract in one pass, no stored archive) ----- #
+    def _stream_download(self, task, url):
+        """Extract the archive straight from the HTTP transfer via libarchive.
+
+        Never writes the .rar to disk -- peak disk use is ~the extracted size.
+        Resumable through a per-task checkpoint (already-extracted files are
+        skipped, and for non-solid archives their bytes aren't re-downloaded).
+        """
+        out_dir = task.dest_dir
+        os.makedirs(out_dir, exist_ok=True)
+        ckpt = task.path + ".ckpt"
+        headers = {"Referer": task.url, **task.headers}
+        task.status = "Connecting"
+        task.done = 0
+        self.emit("update", task)
+
+        state = {"last": time.monotonic(), "last_done": 0, "started": False}
+
+        def on_total(size):
+            task.total = size
+            self.emit("update", task)
+
+        def on_bytes(n):
+            task.done += n
+            self.limiter.throttle(n)              # honor the global bandwidth cap
+            if not state["started"]:
+                state["started"] = True
+                task.status = "Downloading"
+            now = time.monotonic()
+            if now - state["last"] >= 0.4:
+                task.speed = (task.done - state["last_done"]) / (now - state["last"])
+                state["last"], state["last_done"] = now, task.done
+                self.emit("update", task)
+
+        def should_abort():
+            return self.shutdown.is_set() or task.paused
+
+        try:
+            _streaming.download_extract(
+                url, out_dir, ckpt, headers=headers, on_total=on_total,
+                on_bytes=on_bytes, should_abort=should_abort, source=task.name)
+        except _streaming.Aborted:
+            task.status = "Paused"
+            task.speed = 0
+            self.emit("update", task)
+            return
+        except ValueError:
+            raise  # HTML login wall / bad link -> permanent, don't retry
+        except _streaming.NETWORK_ERRORS as e:
+            # A full disk won't fix itself (see _run_one for the clear message);
+            # everything else here is a transient transfer error worth retrying.
+            if isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT):
+                raise
+            raise TransientError(str(e) or e.__class__.__name__)
+
+        try:
+            os.remove(ckpt)
+        except OSError:
+            pass
+        task.done = task.total or task.done
+        task.speed = 0
+        task.status = "Done"
         self.emit("update", task)
         self.emit("completed", task)
 
@@ -1603,6 +1705,10 @@ class Engine:
             groups = {}
             singles = []
             for t in self.tasks:
+                # Stream-extract tasks were already extracted during the transfer
+                # and leave no archive on disk -- 7-Zip has nothing to do.
+                if getattr(t, "stream", False):
+                    continue
                 g = archive_group(t.name)
                 if g:
                     groups.setdefault(g, []).append(t)
@@ -1852,6 +1958,35 @@ class Engine:
 # --------------------------------------------------------------------------- #
 # GUI
 # --------------------------------------------------------------------------- #
+def _attach_tooltip(widget, text):
+    """Show `text` in a small popup while the pointer hovers `widget`."""
+    state = {"win": None}
+
+    def show(_=None):
+        if state["win"] or not text:
+            return
+        try:
+            x = widget.winfo_rootx() + 14
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+        except tk.TclError:
+            return
+        win = tk.Toplevel(widget)
+        win.wm_overrideredirect(True)
+        win.wm_geometry(f"+{x}+{y}")
+        tk.Label(win, text=text, justify="left", background="#ffffe0",
+                 relief="solid", borderwidth=1, wraplength=320,
+                 padx=6, pady=4).pack()
+        state["win"] = win
+
+    def hide(_=None):
+        if state["win"]:
+            state["win"].destroy()
+            state["win"] = None
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1869,6 +2004,9 @@ class App(tk.Tk):
         self.speed_limit = tk.IntVar(value=0)        # KB/s, 0 = unlimited
         self.connections = tk.IntVar(value=1)        # segments per file (1 = off)
         self.delete_after_extract = tk.BooleanVar(value=False)
+        # Extract straight from the transfer (no stored .rar). Off unless the
+        # libarchive backend is present.
+        self.stream_extract = tk.BooleanVar(value=False)
         self.watch_clipboard = tk.BooleanVar(value=False)
         self.to_tray = tk.BooleanVar(value=False)    # close/minimize hides to tray
         self.status_text = tk.StringVar(value="Idle")
@@ -1902,6 +2040,7 @@ class App(tk.Tk):
             "speed_limit": self.speed_limit.get(),
             "connections": self.connections.get(),
             "delete_after_extract": self.delete_after_extract.get(),
+            "stream_extract": self.stream_extract.get(),
             "watch_clipboard": self.watch_clipboard.get(),
             "to_tray": self.to_tray.get(),
             "geometry": self.geometry(),
@@ -1940,6 +2079,9 @@ class App(tk.Tk):
             self.connections.set(int(data["connections"]))
         if "delete_after_extract" in data:
             self.delete_after_extract.set(bool(data["delete_after_extract"]))
+        # Only restore stream-extract if the backend is actually available.
+        if "stream_extract" in data and stream_extract_available():
+            self.stream_extract.set(bool(data["stream_extract"]))
         if "watch_clipboard" in data:
             self.watch_clipboard.set(bool(data["watch_clipboard"]))
         if "to_tray" in data:
@@ -2015,6 +2157,20 @@ class App(tk.Tk):
         ttk.Checkbutton(
             cfg, text="Auto-extract", variable=self.auto_extract
         ).pack(side="left", padx=6)
+        # Stream-extract: only offered when the libarchive backend is available.
+        se = ttk.Checkbutton(cfg, text="Stream extract",
+                             variable=self.stream_extract)
+        se.pack(side="left", padx=6)
+        if not stream_extract_available():
+            self.stream_extract.set(False)
+            se.state(["disabled"])
+            _tip = ("Extract while downloading, without storing the .rar "
+                    "(needs the libarchive backend).")
+        else:
+            _tip = ("Extract while downloading -- never stores the full .rar, so "
+                    "peak disk use is about the extracted size. Single-volume "
+                    "archives only.")
+        _attach_tooltip(se, _tip)
         ttk.Checkbutton(
             cfg, text="Watch clipboard", variable=self.watch_clipboard
         ).pack(side="left", padx=6)
@@ -2527,7 +2683,7 @@ class App(tk.Tk):
                 os.makedirs(folder, exist_ok=True)
             except OSError:
                 folder = base
-            t = Task(u, folder)
+            t = Task(u, folder, stream=self.stream_extract.get())
             self.tasks.append(t)
             self._insert_task_row(t)
             existing.add(u)
@@ -2550,7 +2706,8 @@ class App(tk.Tk):
         for it in items:
             if it["url"] in existing:
                 continue
-            t = Task(it["url"], folder, name=it.get("name"), headers=it.get("headers"))
+            t = Task(it["url"], folder, name=it.get("name"),
+                     headers=it.get("headers"), stream=self.stream_extract.get())
             t.gofile_code = it.get("gofile_code")
             if it.get("size"):
                 t.total = it["size"]
@@ -3089,6 +3246,25 @@ def _run_selftest():
         ]
     except Exception as e:  # noqa
         lines.append(f"ERROR={type(e).__name__}: {e}")
+
+    # Stream-extract backend: confirm the bundled libarchive DLL actually loads
+    # in this build (this is what tells us the native DLLs bundled correctly).
+    try:
+        avail = stream_extract_available()
+        lines.append(f"stream_available={avail}")
+        lines.append(f"LIBARCHIVE={os.environ.get('LIBARCHIVE', '-')}")
+        if not avail and _streaming is not None:
+            lines.append(f"stream_reason={_streaming.unavailable_reason()}")
+        lines.append("STREAM_RESULT=" + ("PASS" if avail else "FAIL"))
+        # requests + certifi power the stream-extract HTTPS transfer; make sure
+        # the CA bundle actually shipped (else SSL verification fails at runtime).
+        import requests as _rq
+        import certifi as _cf
+        lines.append(f"requests={_rq.__version__}")
+        lines.append(f"certifi_ca_exists={os.path.isfile(_cf.where())}")
+    except Exception as e:  # noqa
+        lines.append(f"stream_ERROR={type(e).__name__}: {e}")
+
     with open(os.path.join(app_dir(), "pyget_selftest.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 

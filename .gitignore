@@ -7,6 +7,8 @@ __pycache__/
 build/
 dist/
 *.spec
+# but track the build recipe itself so the exe is reproducible
+!PyGet.spec
 
 # Runtime data, logs, state (machine-specific)
 downloads/
