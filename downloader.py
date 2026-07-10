@@ -57,6 +57,73 @@ PART_SUFFIX = ".part"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+# --------------------------------------------------------------------------- #
+# Windows background-throttling opt-out. When the window isn't in the
+# foreground, Windows lowers this process's CPU frequency (Power Throttling /
+# EcoQoS) and ignores its timer-resolution request (coarse ~15.6 ms tick since
+# Win10 2004) -- both slow a download left running minimized. We opt out of
+# both. No-op / quiet failure off Windows or when the APIs are missing.
+# --------------------------------------------------------------------------- #
+_timer_period_set = False
+
+
+def win_perf_apply():
+    """Keep the process at full speed in the background. Returns what succeeded."""
+    global _timer_period_set
+    result = {"power_throttling_disabled": False, "timer_resolution_raised": False}
+    if os.name != "nt":
+        return result
+    try:  # opt out of Power Throttling / EcoQoS
+        import ctypes
+        from ctypes import wintypes
+
+        class _PowerThrottlingState(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG),
+                        ("ControlMask", wintypes.ULONG),
+                        ("StateMask", wintypes.ULONG)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Explicit signatures -- otherwise the 64-bit process HANDLE truncates.
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetCurrentProcess.argtypes = []
+        k32.SetProcessInformation.restype = wintypes.BOOL
+        k32.SetProcessInformation.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        state = _PowerThrottlingState()
+        state.Version = 1            # PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        # ControlMask picks the knobs; StateMask=0 turns them OFF:
+        #   0x1 EXECUTION_SPEED, 0x4 IGNORE_TIMER_RESOLUTION
+        state.ControlMask = 0x1 | 0x4
+        state.StateMask = 0
+        ProcessPowerThrottling = 4
+        if k32.SetProcessInformation(k32.GetCurrentProcess(),
+                                     ProcessPowerThrottling,
+                                     ctypes.byref(state), ctypes.sizeof(state)):
+            result["power_throttling_disabled"] = True
+    except (OSError, AttributeError):
+        pass
+    try:  # request a 1 ms system timer so background scheduling stays fine
+        import ctypes
+        if ctypes.WinDLL("winmm", use_last_error=True).timeBeginPeriod(1) == 0:
+            _timer_period_set = True
+            result["timer_resolution_raised"] = True
+    except (OSError, AttributeError):
+        pass
+    return result
+
+
+def win_perf_release():
+    """Undo the timer-resolution request (call on exit)."""
+    global _timer_period_set
+    if _timer_period_set and os.name == "nt":
+        try:
+            import ctypes
+            ctypes.WinDLL("winmm").timeEndPeriod(1)
+        except (OSError, AttributeError):
+            pass
+        _timer_period_set = False
+
+
 class TransientError(Exception):
     """A failure worth retrying (timeout, dropped connection, 5xx, 429)."""
 
@@ -1808,6 +1875,7 @@ class App(tk.Tk):
         self._clip_last = ""
         self._tray = None
 
+        win_perf_apply()  # stay at full speed while minimized / in background
         self._build_ui()
         self.engine.tasks = self.tasks               # engine shares the live list
         self._load_state()
@@ -1901,6 +1969,7 @@ class App(tk.Tk):
 
     def _on_close(self):
         self._save_state()
+        win_perf_release()
         self.engine.close()
         if self._tray is not None:
             try:
