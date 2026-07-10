@@ -495,28 +495,43 @@ def _steamrip_all():
         return _steamrip_cache
     h = _fetch_text(STEAMRIP_BASE + "/games-list/", referer=STEAMRIP_BASE + "/")
     games, seen = [], set()
-    # Slugs may carry a version/suffix after "free-download" (e.g.
-    # /alan-wake-2-free-download-v12/, /...-free-download-m1/), so match loosely.
+    # Match every single-path-segment link and keep the ones whose *visible text*
+    # says "Free Download" -- that label is the reliable marker of a game entry.
+    # Older code keyed off "free-download" in the slug, but newer entries use a
+    # bare slug (e.g. /the-last-of-us-part-ii-remastered/), so they were dropped.
     for m in re.finditer(
-        r'<a[^>]+href="((?:https://steamrip\.com)?/[a-z0-9-]*free-download[a-z0-9-]*/?)"[^>]*>(.*?)</a>',
+        r'<a[^>]+href="((?:https://steamrip\.com)?/[a-z0-9][a-z0-9-]*/?)"[^>]*>(.*?)</a>',
         h, re.S,
     ):
         url = m.group(1)
+        title = html.unescape(re.sub(r"<.*?>", "", m.group(2))).strip()
+        if "free download" not in title.lower():
+            continue
         if url.startswith("/"):
             url = STEAMRIP_BASE + url
-        title = html.unescape(re.sub(r"<.*?>", "", m.group(2))).strip()
-        if title and url not in seen:
+        if url not in seen:
             seen.add(url)
             games.append({"title": title, "url": url})
     _steamrip_cache = games
     return games
 
 
+def _search_norm(s):
+    """Lowercase and reduce to space-separated alphanumeric tokens, so hyphens,
+    punctuation, and version suffixes don't block a match."""
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
 def fetch_steamrip_games(page=1, query=None):
     games = _steamrip_all()
     if query:
-        ql = query.lower()
-        games = [g for g in games if ql in g["title"].lower()]
+        # Token-subset match on normalized text: every word of the query must
+        # appear in the title, regardless of order, hyphens, or punctuation.
+        # So "the-last-of-us-part-ii-remastered" matches "The Last of Us Part II
+        # Remastered Free Download (v1.6...)".
+        tokens = _search_norm(query).split()
+        games = [g for g in games
+                 if all(tok in _search_norm(g["title"]) for tok in tokens)]
     per = 40
     return games[(page - 1) * per: page * per]
 
