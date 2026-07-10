@@ -26,6 +26,24 @@ export type SearchResult = {
   source: string;
 };
 
+export type Settings = {
+  dest_dir: string;
+  workers: number;
+  connections: number;
+  auto_extract: boolean;
+  stream_extract: boolean;
+  delete_after_extract: boolean;
+  timeout: number;
+  max_attempts: number;
+  speed_limit: number;
+};
+
+// Native folder picker exposed by Electron preload (null outside Electron).
+export function pickFolder(): Promise<string | null> {
+  const api = (window as any).electronAPI;
+  return api?.pickFolder ? api.pickFolder() : Promise.resolve(null);
+}
+
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -56,11 +74,13 @@ export const pyget = {
   stop: () => j("/api/stop", { method: "POST" }),
   pause: (id: number) => j(`/api/tasks/${id}/pause`, { method: "POST" }),
   resume: (id: number) => j(`/api/tasks/${id}/resume`, { method: "POST" }),
-  cancel: (id: number) => j(`/api/tasks/${id}/cancel`, { method: "POST" }),
+  cancel: (id: number, del = false) =>
+    j(`/api/tasks/${id}/cancel`, { method: "POST", body: JSON.stringify({ delete: del }) }),
+  reveal: (id: number) => j(`/api/tasks/${id}/reveal`, { method: "POST" }),
 
-  getSettings: () => j<Record<string, unknown>>("/api/settings"),
-  setSettings: (s: Record<string, unknown>) =>
-    j("/api/settings", { method: "POST", body: JSON.stringify(s) }),
+  getSettings: () => j<Settings>("/api/settings"),
+  setSettings: (s: Partial<Settings>) =>
+    j<Settings>("/api/settings", { method: "POST", body: JSON.stringify(s) }),
 
   // Server-Sent Events stream. Returns an unsubscribe fn.
   events(handlers: {

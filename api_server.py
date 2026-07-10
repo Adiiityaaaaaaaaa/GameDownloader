@@ -26,6 +26,8 @@ import argparse
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import queue as _queue
@@ -375,16 +377,41 @@ class Controller:
         self.start_all()
         return True
 
-    def cancel(self, task_id):
+    def cancel(self, task_id, delete=False):
         t = self._find(task_id)
         if not t:
             return False
         self.engine.pause(t)
+        if delete:
+            for p in (t.part_path, t.part_path + ".segs", t.part_path + ".ckpt",
+                      t.path):
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except OSError:
+                    pass
         with self._lock:
             if t in self.tasks:
                 self.tasks.remove(t)
         self._broadcast({"type": "removed", "id": task_id})
         return True
+
+    def reveal(self, task_id):
+        """Open the task's folder in the OS file browser (best effort)."""
+        t = self._find(task_id)
+        if not t:
+            return False
+        target = t.dest_dir
+        try:
+            if sys.platform == "win32" and os.path.isfile(t.path):
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(t.path)])
+                return True
+            if hasattr(os, "startfile"):
+                os.startfile(target)  # noqa - Windows only
+                return True
+        except Exception:  # noqa
+            pass
+        return False
 
     def search(self, q, site="steamrip", page=1):
         site = site if site in dl.SITES else "steamrip"
@@ -506,8 +533,11 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._json({"error": "bad id"}, 400)
             action = parts[3]
-            fn = {"pause": CTRL.pause, "resume": CTRL.resume,
-                  "cancel": CTRL.cancel}.get(action)
+            if action == "cancel":
+                return self._json({"ok": CTRL.cancel(tid, bool(body.get("delete")))})
+            if action == "reveal":
+                return self._json({"ok": CTRL.reveal(tid)})
+            fn = {"pause": CTRL.pause, "resume": CTRL.resume}.get(action)
             if fn:
                 return self._json({"ok": fn(tid)})
         return self._json({"error": "not found"}, 404)

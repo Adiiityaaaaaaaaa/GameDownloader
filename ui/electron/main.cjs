@@ -1,7 +1,13 @@
-const { app, BrowserWindow } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog } = require("electron");
 const path = require("path");
 const http = require("http");
 const { spawn } = require("child_process");
+
+// Native folder picker used by the Settings "Browse" button.
+ipcMain.handle("pick-folder", async () => {
+  const res = await dialog.showOpenDialog({ properties: ["openDirectory"] });
+  return res.canceled || !res.filePaths.length ? null : res.filePaths[0];
+});
 
 const PORT = 8787;
 let mainWindow;

@@ -2,9 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Search, Download, Pause, Play, X, Check, Settings, Library, Compass,
   ListChecks, HardDrive, Zap, Cpu, Wifi, Filter, Minus, Square, Gamepad2, Loader2,
+  FolderOpen, Link2, Trash2, Save, Plus,
 } from "lucide-react";
 import {
-  pyget, fmtBytes, fmtSpeed, fmtEta, type Task, type SearchResult,
+  pyget, pickFolder, fmtBytes, fmtSpeed, fmtEta,
+  type Task, type SearchResult, type Settings as Cfg,
 } from "./lib/pyget";
 
 // Deterministic cover hue from a title (no cover art from the source, so we
@@ -104,6 +106,11 @@ export default function Index() {
   const [log, setLog] = useState<{ t: string; text: string }[]>([]);
   const [online, setOnline] = useState(false);
   const [adding, setAdding] = useState<Record<string, boolean>>({});
+  const [page, setPage] = useState(1);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [urlOpen, setUrlOpen] = useState(false);
+  const [urlValue, setUrlValue] = useState("");
   const searchTimer = useRef<number | undefined>(undefined);
 
   // Live event stream from the backend.
@@ -121,17 +128,44 @@ export default function Index() {
   }, []);
 
   // Debounced search. Empty query shows the source's default catalog listing,
-  // so Browse is populated without typing.
+  // so Browse is populated without typing. Query/source change resets to page 1.
   useEffect(() => {
     window.clearTimeout(searchTimer.current);
     setSearching(true);
+    setPage(1);
     const delay = q.trim() ? 350 : 0;
     searchTimer.current = window.setTimeout(() => {
-      pyget.search(q, site).then((r) => setResults(r)).catch(() => setResults([]))
+      pyget.search(q, site, 1).then((r) => setResults(r)).catch(() => setResults([]))
         .finally(() => setSearching(false));
     }, delay);
     return () => window.clearTimeout(searchTimer.current);
   }, [q, site]);
+
+  async function loadMore() {
+    setLoadingMore(true);
+    try {
+      const next = page + 1;
+      const more = await pyget.search(q, site, next);
+      if (more.length) {
+        setResults((r) => {
+          const seen = new Set(r.map((x) => x.url));
+          return [...r, ...more.filter((x) => !seen.has(x.url))];
+        });
+        setPage(next);
+      }
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  async function addByUrl() {
+    const u = urlValue.trim();
+    if (!u) return;
+    await pyget.add(u);
+    setUrlValue("");
+    setUrlOpen(false);
+    setTab("queue");
+  }
 
   const taskList = useMemo(
     () => Object.values(tasks).sort((a, b) => a.id - b.id),
@@ -230,7 +264,10 @@ export default function Index() {
             </div>
           </div>
 
-          <button className="mt-6 flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-sm text-muted-foreground hover:bg-surface-2 hover:text-foreground">
+          <button
+            onClick={() => setShowSettings(true)}
+            className="mt-6 flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-sm text-muted-foreground hover:bg-surface-2 hover:text-foreground"
+          >
             <Settings className="h-4 w-4" /> Settings
           </button>
         </aside>
@@ -249,10 +286,29 @@ export default function Index() {
               />
               {searching && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
             </div>
-            <button className="flex items-center gap-1.5 rounded-md border border-border bg-surface px-3 py-2 text-sm hover:bg-surface-2">
-              <Filter className="h-4 w-4" /> Filters
+            <button
+              onClick={() => setUrlOpen((v) => !v)}
+              className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+            >
+              <Link2 className="h-4 w-4" /> Add URL
             </button>
           </div>
+
+          {urlOpen && (
+            <div className="mt-2 flex items-center gap-2 rounded-md border border-primary/40 bg-surface/60 p-2">
+              <input
+                value={urlValue}
+                autoFocus
+                onChange={(e) => setUrlValue(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") addByUrl(); }}
+                placeholder="Paste a game page or direct download link…"
+                className="w-full bg-transparent px-2 text-sm outline-none placeholder:text-muted-foreground"
+              />
+              <button onClick={addByUrl} className="flex items-center gap-1.5 rounded-sm bg-primary px-3 py-1.5 text-mono text-[11px] font-semibold uppercase tracking-widest text-primary-foreground">
+                <Plus className="h-3.5 w-3.5" /> Add
+              </button>
+            </div>
+          )}
 
           {tab === "browse" && (
             <>
@@ -288,6 +344,18 @@ export default function Index() {
                   </div>
                 ))}
               </div>
+              {results.length > 0 && (
+                <div className="mt-6 flex justify-center">
+                  <button
+                    onClick={loadMore}
+                    disabled={loadingMore}
+                    className="flex items-center gap-2 rounded-md border border-border bg-surface px-4 py-2 text-sm hover:bg-surface-2 disabled:opacity-50"
+                  >
+                    {loadingMore ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                    Load more
+                  </button>
+                </div>
+              )}
             </>
           )}
 
@@ -327,11 +395,16 @@ export default function Index() {
                     {DONE.has(r.status) ? (
                       <span className="grid h-7 w-7 place-items-center text-success"><Check className="h-3.5 w-3.5" /></span>
                     ) : r.status === "Paused" ? (
-                      <button onClick={() => pyget.resume(r.id)} className="grid h-7 w-7 place-items-center rounded-sm text-primary hover:bg-primary/15"><Play className="h-3.5 w-3.5" /></button>
+                      <button onClick={() => pyget.resume(r.id)} title="Resume" className="grid h-7 w-7 place-items-center rounded-sm text-primary hover:bg-primary/15"><Play className="h-3.5 w-3.5" /></button>
                     ) : (
-                      <button onClick={() => pyget.pause(r.id)} className="grid h-7 w-7 place-items-center rounded-sm text-warning hover:bg-warning/15"><Pause className="h-3.5 w-3.5" /></button>
+                      <button onClick={() => pyget.pause(r.id)} title="Pause" className="grid h-7 w-7 place-items-center rounded-sm text-warning hover:bg-warning/15"><Pause className="h-3.5 w-3.5" /></button>
                     )}
-                    <button onClick={() => pyget.cancel(r.id)} className="grid h-7 w-7 place-items-center rounded-sm text-muted-foreground hover:bg-surface-2"><X className="h-3.5 w-3.5" /></button>
+                    <button onClick={() => pyget.reveal(r.id)} title="Open folder" className="grid h-7 w-7 place-items-center rounded-sm text-muted-foreground hover:bg-surface-2"><FolderOpen className="h-3.5 w-3.5" /></button>
+                    <button
+                      onClick={() => { if (confirm(`Remove "${r.name}" and delete its files?`)) pyget.cancel(r.id, true); else pyget.cancel(r.id, false); }}
+                      title="Remove"
+                      className="grid h-7 w-7 place-items-center rounded-sm text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+                    ><Trash2 className="h-3.5 w-3.5" /></button>
                   </div>
                 </div>
               ))}
@@ -387,7 +460,90 @@ export default function Index() {
           </div>
         </aside>
       </div>
+
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
     </div>
+  );
+}
+
+function SettingsPanel({ onClose }: { onClose: () => void }) {
+  const [cfg, setCfg] = useState<Cfg | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { pyget.getSettings().then(setCfg); }, []);
+
+  function set<K extends keyof Cfg>(k: K, v: Cfg[K]) {
+    setCfg((c) => (c ? { ...c, [k]: v } : c));
+  }
+  async function save() {
+    if (!cfg) return;
+    setSaving(true);
+    try { await pyget.setSettings(cfg); onClose(); }
+    finally { setSaving(false); }
+  }
+  async function browse() {
+    const p = await pickFolder();
+    if (p) set("dest_dir", p);
+  }
+
+  const Toggle = ({ k, label, desc }: { k: keyof Cfg; label: string; desc: string }) => (
+    <label className="flex cursor-pointer items-start justify-between gap-3 rounded-md border border-border bg-surface-2/40 p-3">
+      <span>
+        <span className="text-sm">{label}</span>
+        <span className="mt-0.5 block text-mono text-[10px] text-muted-foreground">{desc}</span>
+      </span>
+      <input type="checkbox" checked={!!cfg?.[k]} onChange={(e) => set(k, e.target.checked as never)}
+        className="mt-1 h-4 w-4 accent-[oklch(0.86_0.22_135)]" />
+    </label>
+  );
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-full max-w-lg rounded-lg border border-border bg-surface p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <h2 className="flex items-center gap-2 font-sans text-lg font-bold"><Settings className="h-5 w-5 text-primary" /> Settings</h2>
+          <button onClick={onClose} className="grid h-7 w-7 place-items-center rounded-sm text-muted-foreground hover:bg-surface-2"><X className="h-4 w-4" /></button>
+        </div>
+        {!cfg ? (
+          <div className="grid place-items-center py-10 text-muted-foreground"><Loader2 className="h-5 w-5 animate-spin" /></div>
+        ) : (
+          <div className="mt-4 space-y-3">
+            <div>
+              <div className="text-mono text-[10px] uppercase tracking-widest text-muted-foreground">Save downloads to</div>
+              <div className="mt-1 flex gap-2">
+                <input value={cfg.dest_dir} onChange={(e) => set("dest_dir", e.target.value)}
+                  className="w-full rounded-md border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:border-primary" />
+                <button onClick={browse} className="flex items-center gap-1.5 rounded-md border border-border bg-surface-2 px-3 text-sm hover:bg-surface"><FolderOpen className="h-4 w-4" /> Browse</button>
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <NumField label="Parallel" v={cfg.workers} min={1} max={10} on={(n) => set("workers", n)} />
+              <NumField label="Connections" v={cfg.connections} min={1} max={16} on={(n) => set("connections", n)} />
+              <NumField label="Speed cap KB/s" v={cfg.speed_limit} min={0} max={1000000} on={(n) => set("speed_limit", n)} />
+            </div>
+            <Toggle k="auto_extract" label="Auto-extract" desc="Unpack archives with 7-Zip after download" />
+            <Toggle k="stream_extract" label="Stream extract" desc="Extract while downloading — no stored .rar (single-volume)" />
+            <Toggle k="delete_after_extract" label="Delete archive after extract" desc="Reclaim space once unpacked" />
+          </div>
+        )}
+        <div className="mt-5 flex justify-end gap-2">
+          <button onClick={onClose} className="rounded-md border border-border bg-surface-2 px-4 py-2 text-sm hover:bg-surface">Cancel</button>
+          <button onClick={save} disabled={!cfg || saving} className="flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-50">
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />} Save
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NumField({ label, v, min, max, on }: { label: string; v: number; min: number; max: number; on: (n: number) => void }) {
+  return (
+    <label className="block">
+      <div className="text-mono text-[10px] uppercase tracking-widest text-muted-foreground">{label}</div>
+      <input type="number" value={v} min={min} max={max}
+        onChange={(e) => on(Math.max(min, Math.min(max, Number(e.target.value) || 0)))}
+        className="mt-1 w-full rounded-md border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:border-primary" />
+    </label>
   );
 }
 
