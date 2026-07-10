@@ -20,6 +20,14 @@ pyget.log
 pyget.log.*
 _debug_fuckingfast.html
 
+# Node / Vite / Electron front-end (ui/)
+ui/node_modules/
+ui/dist/
+ui/.output/
+ui/.wrangler/
+ui/electron-release/
+ui/tsconfig.tsbuildinfo
+
 # OS cruft
 Thumbs.db
 desktop.ini
