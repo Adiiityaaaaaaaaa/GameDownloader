@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "electron": "electron .",
     "electron:dev": "vite build && electron .",
-    "package:win": "vite build && npx @electron/packager . RIPTIDE --platform=win32 --arch=x64 --out=electron-release --overwrite --ignore=\"node_modules\" --ignore=\"^/src\""
+    "package:win": "vite build && npx @electron/packager . RIPTIDE --platform=win32 --arch=x64 --out=electron-release --overwrite --extra-resource=backend --ignore=\"node_modules\" --ignore=\"^/src\" --ignore=\"^/backend\" --ignore=\"^/electron-release\""
   },
   "dependencies": {
     "lucide-react": "^0.575.0",

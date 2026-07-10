@@ -7,8 +7,9 @@ __pycache__/
 build/
 dist/
 *.spec
-# but track the build recipe itself so the exe is reproducible
+# but track the build recipes themselves so the exes are reproducible
 !PyGet.spec
+!pyget-backend.spec
 
 # Runtime data, logs, state (machine-specific)
 downloads/
@@ -32,3 +33,8 @@ ui/tsconfig.tsbuildinfo
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Packaging outputs (large; rebuilt via pyget-backend.spec + electron-packager)
+dist_backend/
+ui/backend/
+ui/electron-release/
