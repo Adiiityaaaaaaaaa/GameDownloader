@@ -16,6 +16,12 @@ function hueOf(s: string): number {
 }
 
 function Cover({ title, hue }: { title: string; hue: number }) {
+  const [poster, setPoster] = useState<string | null>(null);
+  useEffect(() => {
+    let ok = true;
+    pyget.cover(title).then((u) => { if (ok) setPoster(u); });
+    return () => { ok = false; };
+  }, [title]);
   return (
     <div
       className="relative aspect-[3/4] w-full overflow-hidden rounded-md border border-border"
@@ -26,11 +32,22 @@ function Cover({ title, hue }: { title: string; hue: number }) {
           linear-gradient(160deg, oklch(0.22 0.05 ${hue}), oklch(0.14 0.02 ${(hue + 200) % 360}))`,
       }}
     >
-      <div className="absolute inset-0 grid-scan opacity-40" />
-      <div className="absolute inset-x-0 bottom-0 p-3">
-        <div className="text-mono text-[10px] uppercase tracking-widest text-white/70">// repack</div>
-        <div className="mt-1 line-clamp-2 font-sans text-sm font-semibold leading-tight text-white drop-shadow">{title}</div>
-      </div>
+      {poster && (
+        <img
+          src={poster}
+          alt={title}
+          loading="lazy"
+          onError={() => setPoster(null)}
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+      )}
+      {!poster && <div className="absolute inset-0 grid-scan opacity-40" />}
+      {!poster && (
+        <div className="absolute inset-x-0 bottom-0 p-3">
+          <div className="text-mono text-[10px] uppercase tracking-widest text-white/70">// repack</div>
+          <div className="mt-1 line-clamp-2 font-sans text-sm font-semibold leading-tight text-white drop-shadow">{title}</div>
+        </div>
+      )}
       <div className="absolute right-2 top-2 rounded-sm bg-black/50 px-1.5 py-0.5 text-mono text-[10px] text-primary backdrop-blur">
         RIP-READY
       </div>
@@ -41,6 +58,8 @@ function Cover({ title, hue }: { title: string; hue: number }) {
 function SourcePill({ s }: { s: string }) {
   const map: Record<string, string> = {
     SteamRIP: "text-primary border-primary/40 bg-primary/10",
+    FitGirl: "text-secondary border-secondary/40 bg-secondary/10",
+    DODI: "text-accent border-accent/40 bg-accent/10",
     BuzzHeavier: "text-accent border-accent/40 bg-accent/10",
     GoFile: "text-secondary border-secondary/40 bg-secondary/10",
     FileDitch: "text-warning border-warning/40 bg-warning/10",
@@ -68,8 +87,16 @@ function barColor(s: string) {
   return "bg-primary";
 }
 
+const SITES = [
+  { id: "steamrip", label: "SteamRIP" },
+  { id: "fitgirl", label: "FitGirl" },
+  { id: "dodi", label: "DODI" },
+] as const;
+type SiteId = (typeof SITES)[number]["id"];
+
 export default function Index() {
   const [tab, setTab] = useState<"browse" | "queue" | "library">("browse");
+  const [site, setSite] = useState<SiteId>("steamrip");
   const [q, setQ] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -93,17 +120,18 @@ export default function Index() {
     return () => { alive = false; stop(); };
   }, []);
 
-  // Debounced search.
+  // Debounced search. Empty query shows the source's default catalog listing,
+  // so Browse is populated without typing.
   useEffect(() => {
     window.clearTimeout(searchTimer.current);
-    if (!q.trim()) { setResults([]); return; }
     setSearching(true);
+    const delay = q.trim() ? 350 : 0;
     searchTimer.current = window.setTimeout(() => {
-      pyget.search(q).then((r) => setResults(r)).catch(() => setResults([]))
+      pyget.search(q, site).then((r) => setResults(r)).catch(() => setResults([]))
         .finally(() => setSearching(false));
-    }, 350);
+    }, delay);
     return () => window.clearTimeout(searchTimer.current);
-  }, [q]);
+  }, [q, site]);
 
   const taskList = useMemo(
     () => Object.values(tasks).sort((a, b) => a.id - b.id),
@@ -176,9 +204,18 @@ export default function Index() {
           </nav>
 
           <div className="mt-6 px-2 text-mono text-[10px] uppercase tracking-widest text-muted-foreground">Sources</div>
-          <div className="mt-2 space-y-1 px-1">
-            {["SteamRIP", "BuzzHeavier", "GoFile", "FileDitch"].map((s) => (
-              <div key={s} className="flex items-center px-1.5 py-1"><SourcePill s={s} /></div>
+          <div className="mt-2 space-y-1">
+            {SITES.map((s) => (
+              <button
+                key={s.id}
+                onClick={() => { setSite(s.id); setTab("browse"); }}
+                className={`flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-sm transition ${
+                  site === s.id ? "bg-primary/15 text-primary" : "text-muted-foreground hover:bg-surface-2 hover:text-foreground"
+                }`}
+              >
+                <span>{s.label}</span>
+                {site === s.id && <span className="h-1.5 w-1.5 rounded-full bg-primary shadow-[0_0_8px] shadow-primary" />}
+              </button>
             ))}
           </div>
 
@@ -207,7 +244,7 @@ export default function Index() {
                 value={q}
                 autoFocus
                 onChange={(e) => { setQ(e.target.value); setTab("browse"); }}
-                placeholder="Search SteamRIP's catalog…"
+                placeholder={`Search ${SITES.find((s) => s.id === site)?.label}'s catalog…`}
                 className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
               />
               {searching && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
@@ -221,13 +258,14 @@ export default function Index() {
             <>
               <div className="mt-6 flex items-baseline justify-between">
                 <h2 className="text-mono text-xs uppercase tracking-widest text-muted-foreground">
-                  {q ? `"${q}" · ${results.length} results` : "Type to search the catalog"}
+                  {q ? `"${q}" · ${results.length} results`
+                     : `${SITES.find((s) => s.id === site)?.label} · latest`}
                 </h2>
               </div>
               {results.length === 0 && !searching && (
                 <div className="mt-16 grid place-items-center text-center text-muted-foreground">
                   <Zap className="h-8 w-8 opacity-40" />
-                  <p className="mt-3 text-sm">{q ? "No matches." : "Search 4,200+ games across SteamRIP."}</p>
+                  <p className="mt-3 text-sm">{q ? "No matches." : `Search ${SITES.find((s) => s.id === site)?.label} — pick a source in the sidebar.`}</p>
                 </div>
               )}
               <div className="mt-3 grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-4">
@@ -243,7 +281,7 @@ export default function Index() {
                     <div className="mt-2 flex items-center justify-between gap-2">
                       <div className="min-w-0">
                         <div className="truncate font-sans text-sm font-medium">{cleanTitle(g.title)}</div>
-                        <div className="text-mono text-[10px] text-muted-foreground">SteamRIP</div>
+                        <div className="text-mono text-[10px] text-muted-foreground">{g.source}</div>
                       </div>
                       <SourcePill s={g.source} />
                     </div>

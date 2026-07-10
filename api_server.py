@@ -25,13 +25,82 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import threading
 import time
 import queue as _queue
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 import downloader as dl
+
+
+# --------------------------------------------------------------------------- #
+# Game cover art. SteamRIP/FitGirl/DODI don't ship box art, so we resolve each
+# title to a Steam appid (keyless) and use Steam's vertical library capsule.
+# Misses return None -> the UI falls back to its generated gradient.
+# --------------------------------------------------------------------------- #
+_COVER_CACHE: dict[str, str | None] = {}
+_COVER_LOCK = threading.Lock()
+_CDN = "https://cdn.cloudflare.steamstatic.com/steam/apps/{}/library_600x900_2x.jpg"
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def _clean_title(t):
+    return re.sub(r"\s*Free Download.*$", "", t or "", flags=re.I).strip() or (t or "")
+
+
+def _get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": dl.USER_AGENT})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _pick_appid(cands, nq):
+    """cands: list of (appid, name). Prefer exact, then prefix, then a two-token
+    contiguous match (rejects 'Alan Walker ... Wake Up' for 'Alan Wake')."""
+    for a, n in cands:
+        if _norm(n) == nq:
+            return a
+    for a, n in cands:
+        if _norm(n).startswith(nq):
+            return a
+    guard = " ".join(nq.split()[:2])
+    for a, n in cands:
+        if guard and guard in _norm(n):
+            return a
+    return None
+
+
+def steam_cover(title):
+    """Return a Steam poster URL for `title`, or None. Cached per title."""
+    key = _clean_title(title)
+    with _COVER_LOCK:
+        if key in _COVER_CACHE:
+            return _COVER_CACHE[key]
+    nq = _norm(key)
+    appid = None
+    try:  # community app search -- precise, games only
+        d = _get_json("https://steamcommunity.com/actions/SearchApps/" + quote(key))
+        appid = _pick_appid([(it["appid"], it.get("name", "")) for it in d], nq)
+    except Exception:  # noqa
+        pass
+    if not appid:
+        try:  # storefront search -- broader, guarded against false positives
+            d = _get_json("https://store.steampowered.com/api/storesearch/?term="
+                          + quote(key) + "&cc=us&l=en")
+            items = d.get("items") or []
+            appid = _pick_appid([(it["id"], it.get("name", "")) for it in items], nq)
+        except Exception:  # noqa
+            pass
+    url = _CDN.format(appid) if appid else None
+    with _COVER_LOCK:
+        _COVER_CACHE[key] = url
+    return url
 
 
 # --------------------------------------------------------------------------- #
@@ -278,11 +347,13 @@ class Controller:
         return True
 
     def search(self, q, site="steamrip", page=1):
-        # SteamRIP is the fully-supported catalog today; the arg keeps room for
-        # more sources without changing the API shape.
-        games = dl.fetch_steamrip_games(page=page, query=q or None)
-        return [{"title": g["title"], "url": g["url"],
-                 "source": "SteamRIP"} for g in games]
+        site = site if site in dl.SITES else "steamrip"
+        label = {"steamrip": "SteamRIP", "fitgirl": "FitGirl",
+                 "dodi": "DODI"}.get(site, site)
+        fetch = dl.SITES[site][1]
+        games = fetch(page=page, query=q or None)
+        return [{"title": g["title"], "url": g["url"], "source": label}
+                for g in games]
 
 
 _SOURCE_HOSTS = [
@@ -354,6 +425,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"results": CTRL.search(q, site, page)})
             except Exception as e:  # noqa
                 return self._json({"error": str(e)}, 500)
+        if path == "/api/cover":
+            title = (qs.get("title") or [""])[0]
+            try:
+                return self._json({"url": steam_cover(title)})
+            except Exception:  # noqa
+                return self._json({"url": None})
         if path == "/api/tasks":
             return self._json({"tasks": CTRL.list_tasks()})
         if path == "/api/settings":

@@ -40,6 +40,10 @@ export const pyget = {
 
   tasks: () => j<{ tasks: Task[] }>("/api/tasks").then((r) => r.tasks),
 
+  cover: (title: string) =>
+    j<{ url: string | null }>(`/api/cover?title=${encodeURIComponent(title)}`)
+      .then((r) => r.url).catch(() => null),
+
   add: (url: string, title?: string) =>
     j("/api/add", { method: "POST", body: JSON.stringify({ url, title }) }),
 
